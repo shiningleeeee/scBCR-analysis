@@ -1,0 +1,361 @@
+=====================================================================================================================wsl的安装及关闭=======================================================================================================================================================================
+#安装wsl至D盘wsl文件夹
+wsl --install --web-download --location D:\wsl 
+#查看所有发行版详细信息,简写wsl -l -v
+wsl --list --verbose 
+#关闭特定发行版
+wsl --terminate Ubuntu
+#关闭所有
+wsl --shutdown
+
+=====================================================================================================================文件夹的建立及包的安装=======================================================================================================================================================================
+#创建文件夹
+mkdir bcr
+cd bcr
+mkdir igblast_tool raw_data references results scripts
+#将原始的测序文件ab1放入raw_data文件夹下
+#安装miniconda3
+cd ~
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+bash Miniconda3-latest-Linux-x86_64.sh
+#装完后执行
+source ~/.bashrc
+#成功后运行下面代码，看到版本说明安装成功
+conda --version
+#创建分析环境
+conda create -n immcantation python=3.9
+#创建完成后激活
+conda activate immcantation
+#安装必要的Python包
+cd ~/bcr
+pip install biopython pandas seaborn matplotlib numpy python-Levenshtein
+
+==================================================================================================================脚本的准备========================================================================================================================================================================
+cd ~/bcr/scripts
+nano 01_ab1_to_fasta.py
+=====================================01_ab1_to_fasta.py======================================================================
+#!/usr/bin/env python3
+import os
+import glob
+from Bio import SeqIO
+
+# === 配置 ===
+INPUT_DIR = "../raw_data"
+OUTPUT_FILE = "../results/01_cleaned_sequences.fasta"
+MIN_LEN = 100 
+
+def process_ab1():
+    ab1_files = sorted(glob.glob(os.path.join(INPUT_DIR, "*.ab1")))
+    if not ab1_files:
+        print("❌ 错误: raw_data 文件夹里没有找到 .ab1 文件！")
+        return
+
+    print(f"📂 发现 {len(ab1_files)} 个 .ab1 文件，开始处理...")
+    
+    with open(OUTPUT_FILE, "w") as out_handle:
+        count = 0
+        for f in ab1_files:
+            file_name = os.path.basename(f)
+            # 假设文件名类似 "Cell01_Heavy.ab1"，去掉后缀作为ID
+            seq_id = file_name.rsplit('.', 1)[0]
+            
+            try:
+                # 核心步骤：abi-trim 会根据质量值切除两端
+                record = SeqIO.read(f, "abi-trim")
+                seq = str(record.seq)
+                
+                # 过滤过短序列
+                if len(seq) >= MIN_LEN:
+                    # 写入fasta
+                    out_handle.write(f">{seq_id}\n{seq}\n")
+                    count += 1
+                else:
+                    print(f"⚠️ 跳过短序列: {seq_id} (长度 {len(seq)})")
+            except Exception as e:
+                print(f"❌ 读取错误 {file_name}: {e}")
+
+    print(f"✅ 处理完成！有效序列: {count}。结果已保存至: {OUTPUT_FILE}")
+
+if __name__ == "__main__":
+    process_ab1()
+===========================================================================================================================
+Ctrl+O 保存
+Enter  确认
+Ctrl+X 退出
+======================================02_run_igblast.sh====================================================================
+#!/bin/bash
+set -e
+
+PROJECT_DIR=~/bcr
+IG_DIR=$PROJECT_DIR/igblast_tool
+REF_DIR=$PROJECT_DIR/references
+RES_DIR=$PROJECT_DIR/results
+
+mkdir -p "$IG_DIR" "$REF_DIR" "$RES_DIR"
+
+echo "===== Step 1: Download IgBlast if not exists ====="
+if [ ! -f "$IG_DIR/bin/igblastn" ]; then
+    cd "$IG_DIR"
+    wget https://ftp.ncbi.nlm.nih.gov/blast/executables/igblast/release/1.22.0/ncbi-igblast-1.22.0-x64-linux.tar.gz
+    tar -xzf ncbi-igblast-1.22.0-x64-linux.tar.gz --strip-components=1
+    rm ncbi-igblast-1.22.0-x64-linux.tar.gz
+else
+    echo "IgBlast 已存在，跳过下载"
+fi
+
+echo "===== Step 2: Download IMGT Germline if not exists ====="
+cd "$REF_DIR"
+if [ ! -f "imgt_ig_v_human.fa" ]; then
+
+    wget https://www.imgt.org/download/V-QUEST/IMGT_V-QUEST_reference_directory/Homo_sapiens/IG/IGHV.fasta
+    wget https://www.imgt.org/download/V-QUEST/IMGT_V-QUEST_reference_directory/Homo_sapiens/IG/IGKV.fasta
+    wget https://www.imgt.org/download/V-QUEST/IMGT_V-QUEST_reference_directory/Homo_sapiens/IG/IGLV.fasta
+    wget https://www.imgt.org/download/V-QUEST/IMGT_V-QUEST_reference_directory/Homo_sapiens/IG/IGHD.fasta
+    wget https://www.imgt.org/download/V-QUEST/IMGT_V-QUEST_reference_directory/Homo_sapiens/IG/IGHJ.fasta
+    wget https://www.imgt.org/download/V-QUEST/IMGT_V-QUEST_reference_directory/Homo_sapiens/IG/IGKJ.fasta
+    wget https://www.imgt.org/download/V-QUEST/IMGT_V-QUEST_reference_directory/Homo_sapiens/IG/IGLJ.fasta
+
+    cat IG*V.fasta > imgt_ig_v_human.fasta
+    cat IG*D.fasta > imgt_ig_d_human.fasta
+    cat IG*J.fasta > imgt_ig_j_human.fasta
+
+    $IG_DIR/bin/edit_imgt_file.pl imgt_ig_v_human.fasta > imgt_ig_v_human.fa
+    $IG_DIR/bin/edit_imgt_file.pl imgt_ig_d_human.fasta > imgt_ig_d_human.fa
+    $IG_DIR/bin/edit_imgt_file.pl imgt_ig_j_human.fasta > imgt_ig_j_human.fa
+fi
+
+echo "===== Step 3: Make BLAST DB ====="
+$IG_DIR/bin/makeblastdb -dbtype nucl -parse_seqids -in "$REF_DIR/imgt_ig_v_human.fa"
+$IG_DIR/bin/makeblastdb -dbtype nucl -parse_seqids -in "$REF_DIR/imgt_ig_d_human.fa"
+$IG_DIR/bin/makeblastdb -dbtype nucl -parse_seqids -in "$REF_DIR/imgt_ig_j_human.fa"
+
+echo "===== Step 4: Run IgBlast ====="
+
+IGDATA="$IG_DIR" \
+$IG_DIR/bin/igblastn \
+    -germline_db_V "$REF_DIR/imgt_ig_v_human.fa" \
+    -germline_db_D "$REF_DIR/imgt_ig_d_human.fa" \
+    -germline_db_J "$REF_DIR/imgt_ig_j_human.fa" \
+    -auxiliary_data "$IG_DIR/optional_file/human_gl.aux" \
+    -organism human \
+    -domain_system kabat \
+    -ig_seqtype Ig \
+    -query "$RES_DIR/01_cleaned_sequences.fasta" \
+    -outfmt 19 \
+    -out "$RES_DIR/02_igblast_results.tsv"
+
+echo "🎉 IgBlast 运行完成！"
+========================================================================================================================
+Ctrl+O 保存
+Enter  确认
+Ctrl+X 退出
+==========================================03_analyze_clones.py==========================================================
+#!/usr/bin/env python3
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+
+try:
+    import Levenshtein
+except ImportError:
+    print("⚠️ 提示: 未安装 python-Levenshtein，将使用较慢的距离计算方法。")
+    Levenshtein = None
+
+# 你的文件路径
+INPUT_FILE = "../results/02_igblast_results.tsv"  # 确保路径对
+OUTPUT_DIR = "../results/analysis_output"
+# 克隆聚类阈值 (0.15 = 85% 相似度)
+DIST_THRESHOLD = 0.15
+
+# 创建输出目录
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+print("Loading data...")
+# 读取 TSV (AIRR 格式)
+df = pd.read_csv(INPUT_FILE, sep="\t")
+
+# 简单清洗
+# 1. 过滤 Productive (你的数据里是用 T/F 表示，还是 True/False，这里做个兼容)
+df['productive'] = df['productive'].astype(str)
+df = df[df['productive'].isin(['T', 'True', 'TRUE'])]
+
+# 2. 提取 Cell ID (用于配对)
+# 假设 Sequence ID 格式为 "Cell01_Heavy" 或 "P1_A01_HC"
+# 逻辑：取第一个下划线前的部分作为 Cell ID
+df['cell_id'] = df['sequence_id'].apply(lambda x: str(x).split('_')[0])
+
+
+# 3. 区分 Heavy / Light 链
+def get_chain_type(v_call):
+    if pd.isna(v_call): return "Unknown"
+    if "IGH" in v_call: return "Heavy"
+    if "IGK" in v_call or "IGL" in v_call: return "Light"
+    return "Unknown"
+
+
+df['chain_type'] = df['v_call'].apply(get_chain_type)
+
+# 4. 简化 V Gene 名称 (去除等位基因，如 IGHV1-18*01 -> IGHV1-18)
+df['v_family'] = df['v_call'].apply(lambda x: x.split('*')[0] if pd.notna(x) else "Unknown")
+df['j_family'] = df['j_call'].apply(lambda x: x.split('*')[0] if pd.notna(x) else "Unknown")
+
+print(f"Data Loaded. Total Productive Sequences: {len(df)}")
+print(df['chain_type'].value_counts())
+
+print("\n--- Generating Gene Usage Plots ---")
+
+# 重链 V Gene
+plt.figure(figsize=(12, 8))
+heavy_v = df[df['chain_type'] == 'Heavy']['v_family'].value_counts().head(20)
+if not heavy_v.empty:
+    sns.barplot(x=heavy_v.values, y=heavy_v.index, palette="viridis")
+    plt.title("Top 20 Heavy Chain V-Gene Usage")
+    plt.xlabel("Count")
+    plt.tight_layout()
+    plt.savefig(f"{OUTPUT_DIR}/Heavy_V_Usage.png")
+
+# 轻链 V Gene
+plt.figure(figsize=(12, 8))
+light_v = df[df['chain_type'] == 'Light']['v_family'].value_counts().head(20)
+if not light_v.empty:
+    sns.barplot(x=light_v.values, y=light_v.index, palette="plasma")
+    plt.title("Top 20 Light Chain V-Gene Usage")
+    plt.xlabel("Count")
+    plt.tight_layout()
+    plt.savefig(f"{OUTPUT_DIR}/Light_V_Usage.png")
+
+print("\n--- Generating SHM Analysis ---")
+# v_identity 代表与 Germline 的一致性。 Mutation Rate = 100 - v_identity
+df['mutation_rate'] = 100 - df['v_identity']
+
+plt.figure(figsize=(8, 6))
+sns.histplot(data=df, x='mutation_rate', hue='chain_type', kde=True, bins=30)
+plt.title("Somatic Hypermutation (SHM) Distribution")
+plt.xlabel("Mutation Rate (%) (100 - v_identity)")
+plt.savefig(f"{OUTPUT_DIR}/SHM_Distribution.png")
+
+# CDR3 长度分布
+df['cdr3_length'] = df['cdr3_aa'].str.len()
+plt.figure(figsize=(8, 6))
+sns.histplot(data=df, x='cdr3_length', hue='chain_type', kde=True, element="step")
+plt.title("CDR3 Amino Acid Length Distribution")
+plt.savefig(f"{OUTPUT_DIR}/CDR3_Length_Distribution.png")
+
+print("\n--- Running Clonal Clustering ---")
+
+# 仅对重链进行聚类
+heavy_df = df[df['chain_type'] == 'Heavy'].copy().reset_index(drop=True)
+
+
+# 定义简单的汉明距离函数
+def hamming_dist(s1, s2):
+    if len(s1) != len(s2): return float('inf')
+    if Levenshtein:
+        return Levenshtein.hamming(s1, s2) / len(s1)
+    else:
+        return sum(c1 != c2 for c1, c2 in zip(s1, s2)) / len(s1)
+
+
+# 聚类逻辑：
+# 1. 必须相同的 V gene (family level) 和 J gene (family level)
+# 2. 必须相同的 CDR3 长度
+# 3. CDR3 核苷酸差异 < 15% (DIST_THRESHOLD)
+
+# 临时生成一个 Group Key 加速
+heavy_df['group_key'] = heavy_df['v_family'] + "_" + heavy_df['j_family'] + "_" + heavy_df['cdr3_aa'].str.len().astype(
+    str)
+
+clone_id_counter = 1
+heavy_df['clone_id'] = -1
+
+# 贪婪聚类算法
+for key, group in heavy_df.groupby('group_key'):
+    indices = group.index.tolist()
+
+    while indices:
+        current_idx = indices.pop(0)
+        # 如果已经被分配了（虽然逻辑上不会，但为了保险）
+        if heavy_df.at[current_idx, 'clone_id'] != -1:
+            continue
+
+        # 分配新 Clone ID
+        current_clone_id = clone_id_counter
+        heavy_df.at[current_idx, 'clone_id'] = current_clone_id
+        clone_seq = heavy_df.at[current_idx, 'cdr3']  # 注意：这里用核苷酸 cdr3 聚类更准，如果只有 aa，改用 cdr3_aa
+
+        # 找同组里剩下的
+        remains = []
+        for other_idx in indices:
+            other_seq = heavy_df.at[other_idx, 'cdr3']
+            # 计算距离
+            dist = hamming_dist(clone_seq, other_seq)
+            if dist <= DIST_THRESHOLD:
+                # 归为同一克隆
+                heavy_df.at[other_idx, 'clone_id'] = current_clone_id
+            else:
+                remains.append(other_idx)
+
+        indices = remains
+        clone_id_counter += 1
+
+print(f"Total Clones Identified: {clone_id_counter - 1}")
+
+print("\n--- Generating Clone Plots ---")
+
+# 统计克隆大小
+clone_counts = heavy_df['clone_id'].value_counts().reset_index()
+clone_counts.columns = ['clone_id', 'size']
+
+# 饼图 (展示前20大克隆 + Others)
+top_n = 19
+top_clones = clone_counts.head(top_n)
+others_count = clone_counts.iloc[top_n:]['size'].sum() if len(clone_counts) > top_n else 0
+
+labels = [f"Clone {cid}" for cid in top_clones['clone_id']]
+sizes = list(top_clones['size'])
+if others_count > 0:
+    labels.append("Others")
+    sizes.append(others_count)
+
+plt.figure(figsize=(10, 10))
+plt.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=140, pctdistance=0.85)
+plt.title(f"Clonal Distribution (Top {top_n})")
+# 画个圈变甜甜圈图
+centre_circle = plt.Circle((0, 0), 0.70, fc='white')
+fig = plt.gcf()
+fig.gca().add_artist(centre_circle)
+plt.tight_layout()
+plt.savefig(f"{OUTPUT_DIR}/Clone_Pie_Chart.png")
+
+# 保存配对结果
+# 把轻链信息合回来
+light_df = df[df['chain_type'] == 'Light'][['cell_id', 'v_call', 'cdr3_aa', 'sequence_id']].rename(columns={
+    'v_call': 'light_v_call', 'cdr3_aa': 'light_cdr3_aa', 'sequence_id': 'light_sequence_id'
+})
+
+final_df = pd.merge(heavy_df, light_df, on='cell_id', how='left')
+final_df = pd.merge(final_df, clone_counts, on='clone_id', how='left')
+
+# 输出最终表格
+final_csv = f"{OUTPUT_DIR}/Final_Clonotypes_Analysis.csv"
+final_df.to_csv(final_csv, index=False)
+print(f"✅ Analysis Complete! Results saved to: {final_csv}")
+===========================================================================================================================
+Ctrl+O 保存
+Enter  确认
+Ctrl+X 退出
+
+===========================================================================================================================执行脚本===============================================================================================================================================================
+python3 01_ab1_to_fasta.py
+bash 02_run_igblast.sh
+python3 03_analyze_clones.py
+
+==================================================================================================================================================================================================================================================================================================
+#results文件夹下的结果请及时转移，避免新运行产生的结果混淆
+#后续只需把原始测序文件放入raw_data文件夹下，依次执行三个脚本即可
+
+
+
+
