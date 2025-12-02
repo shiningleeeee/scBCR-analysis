@@ -188,10 +188,9 @@ df['productive'] = df['productive'].astype(str)
 df = df[df['productive'].isin(['T', 'True', 'TRUE'])]
 
 # 2. 提取 Cell ID (用于配对)
-# 假设 Sequence ID 格式为 "Cell01_Heavy" 或 "P1_A01_HC"
-# 逻辑：取第一个下划线前的部分作为 Cell ID
-df['cell_id'] = df['sequence_id'].apply(lambda x: str(x).split('_')[0])
-
+# 假设 Sequence ID 格式为 "A11-H.HR.900359.G01218F01.F01"
+# 逻辑：取'-'前的部分作为 Cell ID
+df['cell_id'] = df['sequence_id'].apply(lambda x: x.split('-')[0])
 
 # 3. 区分 Heavy / Light 链
 def get_chain_type(v_call):
@@ -328,12 +327,45 @@ if others_count > 0:
 plt.figure(figsize=(10, 10))
 plt.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=140, pctdistance=0.85)
 plt.title(f"Clonal Distribution (Top {top_n})")
-# 画个圈变甜甜圈图
-centre_circle = plt.Circle((0, 0), 0.70, fc='white')
+# 绘制甜甜圈图 
+plt.figure(figsize=(10, 10))
+plt.pie(
+    sizes,
+    labels=labels,
+    autopct='%1.1f%%',
+    startangle=140,
+    pctdistance=0.82,     # 百分比更靠内，避免重叠
+    textprops={'fontsize': 12}
+)
+
+# 画内圈（甜甜圈洞）
+centre_circle = plt.Circle(
+    (0, 0),
+    0.70,                  # 洞大小
+    fc='white',
+    edgecolor='black',
+    linewidth=1.2          # 让洞的边更清晰
+)
 fig = plt.gcf()
 fig.gca().add_artist(centre_circle)
+
+# 写入中心文字（*仅总细胞数*）
+total_cells = heavy_df.shape[0]
+
+plt.text(
+    0, 0,
+    f"N = {total_cells}",   # 中心显示总细胞数
+    ha='center',
+    va='center',
+    fontsize=18,
+    fontweight='bold'
+)
+
+# 标题 & 保存
+plt.title(f"Clonal Distribution (Top {top_n})", fontsize=18, pad=20)
 plt.tight_layout()
-plt.savefig(f"{OUTPUT_DIR}/Clone_Pie_Chart.png")
+plt.savefig(f"{OUTPUT_DIR}/Clone_Pie_Chart.png", dpi=300)
+plt.close()
 
 # 保存配对结果
 # 把轻链信息合回来
