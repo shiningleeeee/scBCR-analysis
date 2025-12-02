@@ -324,9 +324,6 @@ if others_count > 0:
     labels.append("Others")
     sizes.append(others_count)
 
-plt.figure(figsize=(10, 10))
-plt.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=140, pctdistance=0.85)
-plt.title(f"Clonal Distribution (Top {top_n})")
 # 绘制甜甜圈图 
 plt.figure(figsize=(10, 10))
 plt.pie(
