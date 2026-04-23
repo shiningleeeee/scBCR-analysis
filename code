@@ -28,7 +28,7 @@ conda create -n bcr python=3.9
 conda activate bcr
 #安装必要的Python包
 cd ~/bcr
-pip install biopython pandas seaborn matplotlib numpy python-Levenshtein
+pip install biopython pandas seaborn matplotlib numpy 
 
 ==================================================================================================================脚本的准备========================================================================================================================================================================
 cd ~/bcr/scripts
