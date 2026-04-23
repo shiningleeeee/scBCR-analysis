@@ -23,26 +23,29 @@ source ~/.bashrc
 #成功后运行下面代码，看到版本说明安装成功
 conda --version
 #创建分析环境
-conda create -n immcantation python=3.9
+conda create -n bcr python=3.9
 #创建完成后激活
-conda activate immcantation
+conda activate bcr
 #安装必要的Python包
 cd ~/bcr
 pip install biopython pandas seaborn matplotlib numpy python-Levenshtein
 
 ==================================================================================================================脚本的准备========================================================================================================================================================================
 cd ~/bcr/scripts
-nano 01_ab1_to_fasta.py
+vim 01_ab1_to_fasta.py
+i 进入插入模式，粘贴下面这个脚本
 =====================================01_ab1_to_fasta.py======================================================================
 #!/usr/bin/env python3
 import os
 import glob
+import csv
 from Bio import SeqIO
 
-# === 配置 ===
 INPUT_DIR = "../raw_data"
-OUTPUT_FILE = "../results/01_cleaned_sequences.fasta"
-MIN_LEN = 100 
+TRIMMED_FASTA = "../results/01_cleaned_sequences.fasta"
+RAW_FASTA = "../results/01_raw_sequences.fasta"
+SUMMARY_FILE = "../results/01_sequence_summary.tsv"
+MIN_LEN = 100
 
 def process_ab1():
     ab1_files = sorted(glob.glob(os.path.join(INPUT_DIR, "*.ab1")))
@@ -50,338 +53,696 @@ def process_ab1():
         print("❌ 错误: raw_data 文件夹里没有找到 .ab1 文件！")
         return
 
+    os.makedirs(os.path.dirname(TRIMMED_FASTA), exist_ok=True)
+
     print(f"📂 发现 {len(ab1_files)} 个 .ab1 文件，开始处理...")
-    
-    with open(OUTPUT_FILE, "w") as out_handle:
-        count = 0
+
+    kept = 0
+    skipped = 0
+    failed = 0
+
+    with open(TRIMMED_FASTA, "w") as trim_handle, \
+         open(RAW_FASTA, "w") as raw_handle, \
+         open(SUMMARY_FILE, "w", newline="", encoding="utf-8") as summary_handle:
+
+        writer = csv.writer(summary_handle, delimiter="\t")
+        writer.writerow(["seq_id", "raw_len", "trimmed_len", "status", "note"])
+
         for f in ab1_files:
             file_name = os.path.basename(f)
-            # 假设文件名类似 "Cell01_Heavy.ab1"，去掉后缀作为ID
-            seq_id = file_name.rsplit('.', 1)[0]
-            
-            try:
-                # 核心步骤：abi-trim 会根据质量值切除两端
-                record = SeqIO.read(f, "abi-trim")
-                seq = str(record.seq)
-                
-                # 过滤过短序列
-                if len(seq) >= MIN_LEN:
-                    # 写入fasta
-                    out_handle.write(f">{seq_id}\n{seq}\n")
-                    count += 1
-                else:
-                    print(f"⚠️ 跳过短序列: {seq_id} (长度 {len(seq)})")
-            except Exception as e:
-                print(f"❌ 读取错误 {file_name}: {e}")
+            seq_id = file_name.rsplit(".", 1)[0]
 
-    print(f"✅ 处理完成！有效序列: {count}。结果已保存至: {OUTPUT_FILE}")
+            try:
+                raw_record = SeqIO.read(f, "abi")
+                trim_record = SeqIO.read(f, "abi-trim")
+
+                raw_seq = str(raw_record.seq).upper()
+                trim_seq = str(trim_record.seq).upper()
+
+                raw_handle.write(f">{seq_id}\n{raw_seq}\n")
+
+                raw_len = len(raw_seq)
+                trimmed_len = len(trim_seq)
+
+                if trimmed_len >= MIN_LEN:
+                    trim_handle.write(f">{seq_id}\n{trim_seq}\n")
+                    writer.writerow([seq_id, raw_len, trimmed_len, "kept", ""])
+                    kept += 1
+                else:
+                    writer.writerow([seq_id, raw_len, trimmed_len, "skipped", f"trimmed_len < {MIN_LEN}"])
+                    print(f"⚠️ 跳过短序列: {seq_id} (raw={raw_len}, trimmed={trimmed_len})")
+                    skipped += 1
+
+            except Exception as e:
+                writer.writerow([seq_id, "", "", "failed", str(e)])
+                print(f"❌ 读取错误 {file_name}: {e}")
+                failed += 1
+
+    print(f"✅ 完成！保留 {kept} 条，跳过 {skipped} 条，失败 {failed} 条")
+    print(f"📄 Trimmed fasta: {TRIMMED_FASTA}")
+    print(f"📄 Raw fasta: {RAW_FASTA}")
+    print(f"📄 Summary: {SUMMARY_FILE}")
 
 if __name__ == "__main__":
     process_ab1()
 ===========================================================================================================================
-Ctrl+O 保存
-Enter  确认
-Ctrl+X 退出
+Esc 退出插入模式
+:wq 保存文件并退出
 ===========================================================================================================================
-cd ~/bcr/scripts
-nano 02_run_igblast.sh
+vim 02_run_igblast.sh
+i 进入插入模式，粘贴下面这个脚本
 ======================================02_run_igblast.sh====================================================================
 #!/bin/bash
-set -e
+set -euo pipefail
 
 PROJECT_DIR=~/bcr
-IG_DIR=$PROJECT_DIR/igblast_tool
-REF_DIR=$PROJECT_DIR/references
-RES_DIR=$PROJECT_DIR/results
+IG_DIR="$PROJECT_DIR/igblast_tool"
+REF_DIR="$PROJECT_DIR/references"
+RES_DIR="$PROJECT_DIR/results"
+THREADS=4
+
+export IGDATA="$IG_DIR"
 
 mkdir -p "$IG_DIR" "$REF_DIR" "$RES_DIR"
 
-echo "===== Step 1: Download IgBlast if not exists ====="
-if [ ! -f "$IG_DIR/bin/igblastn" ]; then
+download_file() {
+    local url="$1"
+    local out="$2"
+    if [ ! -f "$out" ]; then
+        wget -c --tries=3 --timeout=30 -O "$out" "$url"
+    fi
+}
+
+build_db_if_needed() {
+    local fasta="$1"
+    if [ ! -f "${fasta}.nsq" ]; then
+        "$IG_DIR/bin/makeblastdb" -dbtype nucl -parse_seqids -in "$fasta"
+    fi
+}
+
+echo "===== Step 1: Download IgBLAST if not exists ====="
+if [ ! -x "$IG_DIR/bin/igblastn" ]; then
     cd "$IG_DIR"
-    wget https://ftp.ncbi.nlm.nih.gov/blast/executables/igblast/release/1.22.0/ncbi-igblast-1.22.0-x64-linux.tar.gz
+    download_file \
+        "https://ftp.ncbi.nlm.nih.gov/blast/executables/igblast/release/1.22.0/ncbi-igblast-1.22.0-x64-linux.tar.gz" \
+        "ncbi-igblast-1.22.0-x64-linux.tar.gz"
     tar -xzf ncbi-igblast-1.22.0-x64-linux.tar.gz --strip-components=1
-    rm ncbi-igblast-1.22.0-x64-linux.tar.gz
+    rm -f ncbi-igblast-1.22.0-x64-linux.tar.gz
 else
-    echo "IgBlast 已存在，跳过下载"
+    echo "IgBLAST already exists, skip download."
 fi
 
-echo "===== Step 2: Download IMGT Germline if not exists ====="
+echo "===== Step 2: Download and prepare reference files ====="
 cd "$REF_DIR"
-if [ ! -f "imgt_ig_v_human.fa" ]; then
 
-    wget https://www.imgt.org/download/V-QUEST/IMGT_V-QUEST_reference_directory/Homo_sapiens/IG/IGHV.fasta
-    wget https://www.imgt.org/download/V-QUEST/IMGT_V-QUEST_reference_directory/Homo_sapiens/IG/IGKV.fasta
-    wget https://www.imgt.org/download/V-QUEST/IMGT_V-QUEST_reference_directory/Homo_sapiens/IG/IGLV.fasta
-    wget https://www.imgt.org/download/V-QUEST/IMGT_V-QUEST_reference_directory/Homo_sapiens/IG/IGHD.fasta
-    wget https://www.imgt.org/download/V-QUEST/IMGT_V-QUEST_reference_directory/Homo_sapiens/IG/IGHJ.fasta
-    wget https://www.imgt.org/download/V-QUEST/IMGT_V-QUEST_reference_directory/Homo_sapiens/IG/IGKJ.fasta
-    wget https://www.imgt.org/download/V-QUEST/IMGT_V-QUEST_reference_directory/Homo_sapiens/IG/IGLJ.fasta
+if [ ! -f "$REF_DIR/imgt_ig_v_human.fa" ] || \
+   [ ! -f "$REF_DIR/imgt_ig_d_human.fa" ] || \
+   [ ! -f "$REF_DIR/imgt_ig_j_human.fa" ]; then
 
-    cat IG*V.fasta > imgt_ig_v_human.fasta
-    cat IG*D.fasta > imgt_ig_d_human.fasta
-    cat IG*J.fasta > imgt_ig_j_human.fasta
+    for gene in IGHV IGKV IGLV IGHD IGHJ IGKJ IGLJ; do
+        download_file \
+            "https://www.imgt.org/download/V-QUEST/IMGT_V-QUEST_reference_directory/Homo_sapiens/IG/${gene}.fasta" \
+            "${gene}.fasta"
+    done
 
-    $IG_DIR/bin/edit_imgt_file.pl imgt_ig_v_human.fasta > imgt_ig_v_human.fa
-    $IG_DIR/bin/edit_imgt_file.pl imgt_ig_d_human.fasta > imgt_ig_d_human.fa
-    $IG_DIR/bin/edit_imgt_file.pl imgt_ig_j_human.fasta > imgt_ig_j_human.fa
+    cat IGHV.fasta IGKV.fasta IGLV.fasta > imgt_ig_v_human.fasta
+    cat IGHD.fasta > imgt_ig_d_human.fasta
+    cat IGHJ.fasta IGKJ.fasta IGLJ.fasta > imgt_ig_j_human.fasta
+
+    "$IG_DIR/bin/edit_imgt_file.pl" imgt_ig_v_human.fasta > imgt_ig_v_human.fa
+    "$IG_DIR/bin/edit_imgt_file.pl" imgt_ig_d_human.fasta > imgt_ig_d_human.fa
+    "$IG_DIR/bin/edit_imgt_file.pl" imgt_ig_j_human.fasta > imgt_ig_j_human.fa
+
+    rm -f IGHV.fasta IGKV.fasta IGLV.fasta IGHD.fasta IGHJ.fasta IGKJ.fasta IGLJ.fasta
+else
+    echo "V/D/J reference fasta already exists, skip rebuilding."
 fi
 
-echo "===== Step 3: Make BLAST DB ====="
-$IG_DIR/bin/makeblastdb -dbtype nucl -parse_seqids -in "$REF_DIR/imgt_ig_v_human.fa"
-$IG_DIR/bin/makeblastdb -dbtype nucl -parse_seqids -in "$REF_DIR/imgt_ig_d_human.fa"
-$IG_DIR/bin/makeblastdb -dbtype nucl -parse_seqids -in "$REF_DIR/imgt_ig_j_human.fa"
+if [ ! -f "$REF_DIR/human_C_genes.fasta" ]; then
+    download_file \
+        "https://ftp.ncbi.nlm.nih.gov/blast/executables/igblast/release/database/ncbi_human_c_genes.tar" \
+        "ncbi_human_c_genes.tar"
+    tar -xf ncbi_human_c_genes.tar
+    rm -f ncbi_human_c_genes.tar
 
-echo "===== Step 4: Run IgBlast ====="
+    "$IG_DIR/bin/blastdbcmd" -db ncbi_human_c_genes -entry all -out human_C_genes.fasta
+else
+    echo "Constant region fasta already exists, skip."
+fi
 
-IGDATA="$IG_DIR" \
-$IG_DIR/bin/igblastn \
-    -germline_db_V "$REF_DIR/imgt_ig_v_human.fa" \
-    -germline_db_D "$REF_DIR/imgt_ig_d_human.fa" \
-    -germline_db_J "$REF_DIR/imgt_ig_j_human.fa" \
-    -auxiliary_data "$IG_DIR/optional_file/human_gl.aux" \
-    -organism human \
-    -domain_system kabat \
-    -ig_seqtype Ig \
-    -query "$RES_DIR/01_cleaned_sequences.fasta" \
-    -outfmt 19 \
-    -out "$RES_DIR/02_igblast_results.tsv"
+echo "===== Step 3: Build BLAST databases if needed ====="
+build_db_if_needed "$REF_DIR/imgt_ig_v_human.fa"
+build_db_if_needed "$REF_DIR/imgt_ig_d_human.fa"
+build_db_if_needed "$REF_DIR/imgt_ig_j_human.fa"
 
-echo "🎉 IgBlast 运行完成！"
+if [ -f "$REF_DIR/human_C_genes.fasta" ]; then
+    build_db_if_needed "$REF_DIR/human_C_genes.fasta"
+fi
+
+echo "===== Step 4: Check input fasta ====="
+QUERY_FILE="$RES_DIR/01_cleaned_sequences.fasta"
+OUT_FILE="$RES_DIR/02_igblast_results.tsv"
+
+if [ ! -s "$QUERY_FILE" ]; then
+    echo "❌ Error: input fasta not found or empty: $QUERY_FILE"
+    exit 1
+fi
+
+if [ ! -f "$IG_DIR/optional_file/human_gl.aux" ]; then
+    echo "❌ Error: auxiliary file not found: $IG_DIR/optional_file/human_gl.aux"
+    exit 1
+fi
+
+echo "===== Step 5: Run IgBLAST ====="
+CMD=(
+    "$IG_DIR/bin/igblastn"
+    -germline_db_V "$REF_DIR/imgt_ig_v_human.fa"
+    -germline_db_D "$REF_DIR/imgt_ig_d_human.fa"
+    -germline_db_J "$REF_DIR/imgt_ig_j_human.fa"
+    -auxiliary_data "$IG_DIR/optional_file/human_gl.aux"
+    -organism human
+    -domain_system imgt
+    -ig_seqtype Ig
+    -query "$QUERY_FILE"
+    -outfmt 19
+    -num_threads "$THREADS"
+    -out "$OUT_FILE"
+)
+
+if [ -f "$REF_DIR/human_C_genes.fasta" ]; then
+    CMD+=(-c_region_db "$REF_DIR/human_C_genes.fasta")
+fi
+
+"${CMD[@]}"
+
+echo "✅ IgBLAST done."
+echo "Output: $OUT_FILE"
 ========================================================================================================================
-Ctrl+O 保存
-Enter  确认
-Ctrl+X 退出
+Esc 退出插入模式
+:wq 保存文件并退出
 =========================================================================================================================
-cd ~/bcr/scripts
-nano 03_analyze_clones.py
+vim 03_analyze_clones.py
+i 进入插入模式，粘贴下面这个脚本
 ==========================================03_analyze_clones.py==========================================================
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+
+import os
+import re
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
-import numpy as np
-import os
 
-try:
-    import Levenshtein
-except ImportError:
-    print("⚠️ 提示: 未安装 python-Levenshtein，将使用较慢的距离计算方法。")
-    Levenshtein = None
 
-# 你的文件路径
-INPUT_FILE = "../results/02_igblast_results.tsv"  # 确保路径对
+# =========================
+# 1. 路径和参数：只改这里
+# =========================
+INPUT_FILE = "../results/02_igblast_results.tsv"
 OUTPUT_DIR = "../results/analysis_output"
-# 克隆聚类阈值 (0.15 = 85% 相似度)
-DIST_THRESHOLD = 0.15
 
-# 创建输出目录
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+# junction nt 最大归一化 Hamming 距离
+MAX_DISTANCE = 0.15
 
-print("Loading data...")
-# 读取 TSV (AIRR 格式)
-df = pd.read_csv(INPUT_FILE, sep="\t")
+# 是否按 sequence_id 去重
+DROP_DUPLICATE_SEQUENCE_ID = False
 
-# 简单清洗
-# 1. 过滤 Productive (你的数据里是用 T/F 表示，还是 True/False，这里做个兼容)
-df['productive'] = df['productive'].astype(str)
-df = df[df['productive'].isin(['T', 'True', 'TRUE'])]
+# 饼图显示前几个 clone
+TOP_N_CLONES_IN_PIE = 19
 
-# 2. 提取 Cell ID (用于配对)
-# 假设 Sequence ID 格式为 "A11-H.HR.900359.G01218F01.F01"
-# 逻辑：取'-'前的部分作为 Cell ID
-df['cell_id'] = df['sequence_id'].apply(lambda x: x.split('-')[0])
 
-# 3. 区分 Heavy / Light 链
+# =========================
+# 2. 基础定义
+# =========================
+TRUTHY = {"T", "TRUE", "1", "YES", "Y"}
+FAKE_NULL = {"", "NA", "NAN", "NONE", "NULL"}
+
+
+# =========================
+# 3. 基础函数
+# =========================
+def is_truthy(x):
+    if pd.isna(x):
+        return False
+    return str(x).strip().upper() in TRUTHY
+
+
 def get_chain_type(v_call):
-    if pd.isna(v_call): return "Unknown"
-    if "IGH" in v_call: return "Heavy"
-    if "IGK" in v_call or "IGL" in v_call: return "Light"
+    if pd.isna(v_call):
+        return "Unknown"
+    s = str(v_call).upper()
+    if "IGH" in s:
+        return "Heavy"
+    if "IGK" in s or "IGL" in s:
+        return "Light"
     return "Unknown"
 
 
-df['chain_type'] = df['v_call'].apply(get_chain_type)
+def is_heavy_chain(v_call):
+    return get_chain_type(v_call) == "Heavy"
 
-# 4. 简化 V Gene 名称 (去除等位基因，如 IGHV1-18*01 -> IGHV1-18)
-df['v_family'] = df['v_call'].apply(lambda x: x.split('*')[0] if pd.notna(x) else "Unknown")
-df['j_family'] = df['j_call'].apply(lambda x: x.split('*')[0] if pd.notna(x) else "Unknown")
 
-print(f"Data Loaded. Total Productive Sequences: {len(df)}")
-print(df['chain_type'].value_counts())
+def first_call(x):
+    """
+    v_call/j_call 有时可能有多个候选，用逗号分隔。
+    默认取第一个。
+    """
+    if pd.isna(x):
+        return ""
+    return str(x).split(",")[0].strip()
 
-print("\n--- Generating Gene Usage Plots ---")
 
-# 重链 V Gene
-plt.figure(figsize=(12, 8))
-heavy_v = df[df['chain_type'] == 'Heavy']['v_family'].value_counts().head(20)
-if not heavy_v.empty:
-    sns.barplot(x=heavy_v.values, y=heavy_v.index, palette="viridis")
-    plt.title("Top 20 Heavy Chain V-Gene Usage")
-    plt.xlabel("Count")
+def strip_allele(x):
+    """
+    IGHV3-23*01 -> IGHV3-23
+    """
+    x = first_call(x)
+    if not x:
+        return ""
+    return x.split("*")[0].strip()
+
+
+def normalize_cdr3_aa(x):
+    """
+    用于画 CDR3 length 分布图
+    避免 NaN 变成 'nan'
+    """
+    if pd.isna(x):
+        return None
+    s = str(x).strip().upper()
+    if s in FAKE_NULL:
+        return None
+    if not re.fullmatch(r"[A-Z\*\-]+", s):
+        return None
+    return s
+
+
+def normalize_junction_nt(x):
+    """
+    用于 clonotyping 的 junction nt
+    - 缺失值返回 None
+    - 避免 NaN 被转成 'nan'
+    - 转大写
+    - 只允许纯字母序列
+    """
+    if pd.isna(x):
+        return None
+
+    s = str(x).strip().upper()
+
+    if s in FAKE_NULL:
+        return None
+
+    if not re.fullmatch(r"[A-Z]+", s):
+        return None
+
+    return s
+
+
+def normalized_hamming_distance(seq1, seq2):
+    """
+    同长度序列的归一化 Hamming 距离
+    """
+    if len(seq1) != len(seq2):
+        raise ValueError("Hamming distance requires equal-length sequences.")
+    if len(seq1) == 0:
+        return 0.0
+
+    mismatches = sum(a != b for a, b in zip(seq1, seq2))
+    return mismatches / len(seq1)
+
+
+# =========================
+# 4. Union-Find
+# =========================
+class UnionFind:
+    def __init__(self, items):
+        self.parent = {x: x for x in items}
+
+    def find(self, x):
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, a, b):
+        ra = self.find(a)
+        rb = self.find(b)
+        if ra != rb:
+            self.parent[rb] = ra
+
+
+# =========================
+# 5. 画图函数
+# =========================
+def plot_gene_usage(df, output_dir):
+    print("\n--- Generating Gene Usage Plots ---")
+
+    # Heavy V gene
+    heavy_df = df[df["chain_type"] == "Heavy"].copy()
+    heavy_v = heavy_df["v_gene"].dropna().value_counts().head(20)
+
+    if not heavy_v.empty:
+        plt.figure(figsize=(12, 8))
+        sns.barplot(x=heavy_v.values, y=heavy_v.index, palette="viridis")
+        plt.title("Top 20 Heavy Chain V-Gene Usage")
+        plt.xlabel("Count")
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "Heavy_V_Usage.png"), dpi=300)
+        plt.close()
+
+    # Light V gene
+    light_df = df[df["chain_type"] == "Light"].copy()
+    light_v = light_df["v_gene"].dropna().value_counts().head(20)
+
+    if not light_v.empty:
+        plt.figure(figsize=(12, 8))
+        sns.barplot(x=light_v.values, y=light_v.index, palette="plasma")
+        plt.title("Top 20 Light Chain V-Gene Usage")
+        plt.xlabel("Count")
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "Light_V_Usage.png"), dpi=300)
+        plt.close()
+
+
+def plot_shm(df, output_dir):
+    print("\n--- Generating SHM Analysis ---")
+
+    plot_df = df.copy()
+    plot_df["v_identity_num"] = pd.to_numeric(plot_df["v_identity"], errors="coerce")
+    plot_df = plot_df.dropna(subset=["v_identity_num"]).copy()
+
+    if plot_df.empty:
+        print("No valid v_identity found. Skip SHM plot.")
+        return
+
+    # 默认按百分比处理：mutation_rate = 100 - v_identity
+    plot_df["mutation_rate"] = 100 - plot_df["v_identity_num"]
+
+    plt.figure(figsize=(8, 6))
+    sns.histplot(data=plot_df, x="mutation_rate", hue="chain_type", kde=True, bins=30)
+    plt.title("Somatic Hypermutation (SHM) Distribution")
+    plt.xlabel("Mutation Rate (%) (100 - v_identity)")
     plt.tight_layout()
-    plt.savefig(f"{OUTPUT_DIR}/Heavy_V_Usage.png")
+    plt.savefig(os.path.join(output_dir, "SHM_Distribution.png"), dpi=300)
+    plt.close()
 
-# 轻链 V Gene
-plt.figure(figsize=(12, 8))
-light_v = df[df['chain_type'] == 'Light']['v_family'].value_counts().head(20)
-if not light_v.empty:
-    sns.barplot(x=light_v.values, y=light_v.index, palette="plasma")
-    plt.title("Top 20 Light Chain V-Gene Usage")
-    plt.xlabel("Count")
+
+def plot_cdr3_length(df, output_dir):
+    print("\n--- Generating CDR3 Length Distribution ---")
+
+    plot_df = df.copy()
+    plot_df["cdr3_aa_clean"] = plot_df["cdr3_aa"].apply(normalize_cdr3_aa) if "cdr3_aa" in plot_df.columns else None
+
+    if "cdr3_aa_clean" not in plot_df.columns:
+        print("No cdr3_aa column found. Skip CDR3 length plot.")
+        return
+
+    plot_df = plot_df.dropna(subset=["cdr3_aa_clean"]).copy()
+
+    if plot_df.empty:
+        print("No valid cdr3_aa found. Skip CDR3 length plot.")
+        return
+
+    plot_df["cdr3_length"] = plot_df["cdr3_aa_clean"].str.len()
+
+    plt.figure(figsize=(8, 6))
+    sns.histplot(data=plot_df, x="cdr3_length", hue="chain_type", kde=True, element="step")
+    plt.title("CDR3 Amino Acid Length Distribution")
+    plt.xlabel("CDR3 Length (aa)")
     plt.tight_layout()
-    plt.savefig(f"{OUTPUT_DIR}/Light_V_Usage.png")
-
-print("\n--- Generating SHM Analysis ---")
-# v_identity 代表与 Germline 的一致性。 Mutation Rate = 100 - v_identity
-df['mutation_rate'] = 100 - df['v_identity']
-
-plt.figure(figsize=(8, 6))
-sns.histplot(data=df, x='mutation_rate', hue='chain_type', kde=True, bins=30)
-plt.title("Somatic Hypermutation (SHM) Distribution")
-plt.xlabel("Mutation Rate (%) (100 - v_identity)")
-plt.savefig(f"{OUTPUT_DIR}/SHM_Distribution.png")
-
-# CDR3 长度分布
-df['cdr3_length'] = df['cdr3_aa'].str.len()
-plt.figure(figsize=(8, 6))
-sns.histplot(data=df, x='cdr3_length', hue='chain_type', kde=True, element="step")
-plt.title("CDR3 Amino Acid Length Distribution")
-plt.savefig(f"{OUTPUT_DIR}/CDR3_Length_Distribution.png")
-
-print("\n--- Running Clonal Clustering ---")
-
-# 仅对重链进行聚类
-heavy_df = df[df['chain_type'] == 'Heavy'].copy().reset_index(drop=True)
+    plt.savefig(os.path.join(output_dir, "CDR3_Length_Distribution.png"), dpi=300)
+    plt.close()
 
 
-# 定义简单的汉明距离函数
-def hamming_dist(s1, s2):
-    if len(s1) != len(s2): return float('inf')
-    if Levenshtein:
-        return Levenshtein.hamming(s1, s2) / len(s1)
-    else:
-        return sum(c1 != c2 for c1, c2 in zip(s1, s2)) / len(s1)
+def plot_clone_donut(clone_counts, total_cells, output_dir, top_n=19):
+    print("\n--- Generating Clone Pie Chart ---")
+
+    if clone_counts.empty:
+        print("No clone counts available. Skip clone pie chart.")
+        return
+
+    top_clones = clone_counts.head(top_n)
+    others_count = clone_counts.iloc[top_n:]["size"].sum() if len(clone_counts) > top_n else 0
+
+    labels = [f"Clone {cid}" for cid in top_clones["clone_id"]]
+    sizes = list(top_clones["size"])
+
+    if others_count > 0:
+        labels.append("Others")
+        sizes.append(others_count)
+
+    plt.figure(figsize=(10, 10))
+    plt.pie(
+        sizes,
+        labels=labels,
+        autopct="%1.1f%%",
+        startangle=140,
+        pctdistance=0.82,
+        textprops={"fontsize": 12}
+    )
+
+    centre_circle = plt.Circle(
+        (0, 0),
+        0.70,
+        fc="white",
+        edgecolor="black",
+        linewidth=1.2
+    )
+    fig = plt.gcf()
+    fig.gca().add_artist(centre_circle)
+
+    plt.text(
+        0, 0,
+        f"N = {total_cells}",
+        ha="center",
+        va="center",
+        fontsize=18,
+        fontweight="bold"
+    )
+
+    plt.title(f"Clonal Distribution (Top {top_n})", fontsize=18, pad=20)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "Clone_Pie_Chart.png"), dpi=300)
+    plt.close()
 
 
-# 聚类逻辑：
-# 1. 必须相同的 V gene (family level) 和 J gene (family level)
-# 2. 必须相同的 CDR3 长度
-# 3. CDR3 核苷酸差异 < 15% (DIST_THRESHOLD)
+# =========================
+# 6. 数据读取与清洗
+# =========================
+def load_raw_data(input_file):
+    print(f"Loading data from: {input_file}")
+    df = pd.read_csv(input_file, sep="\t", dtype=str)
 
-# 临时生成一个 Group Key 加速
-heavy_df['group_key'] = heavy_df['v_family'] + "_" + heavy_df['j_family'] + "_" + heavy_df['cdr3_aa'].str.len().astype(
-    str)
+    required_cols = ["sequence_id", "productive", "v_call", "j_call"]
+    missing_cols = [c for c in required_cols if c not in df.columns]
+    if missing_cols:
+        raise ValueError(
+            f"输入文件缺少必要列: {missing_cols}\n"
+            f"至少需要: {required_cols}"
+        )
 
-clone_id_counter = 1
-heavy_df['clone_id'] = -1
+    # productive
+    df["productive_bool"] = df["productive"].apply(is_truthy)
+    df = df[df["productive_bool"]].copy()
 
-# 贪婪聚类算法
-for key, group in heavy_df.groupby('group_key'):
-    indices = group.index.tolist()
+    # chain type
+    df["chain_type"] = df["v_call"].apply(get_chain_type)
 
-    while indices:
-        current_idx = indices.pop(0)
-        # 如果已经被分配了（虽然逻辑上不会，但为了保险）
-        if heavy_df.at[current_idx, 'clone_id'] != -1:
+    # V/J gene
+    df["v_gene"] = df["v_call"].apply(strip_allele)
+    df["j_gene"] = df["j_call"].apply(strip_allele)
+
+    return df.reset_index(drop=True)
+
+
+def prepare_heavy_clonotyping_input(df):
+    """
+    只准备 heavy-only clonotyping 所需输入
+    """
+    if "junction" not in df.columns:
+        raise ValueError("输入文件缺少 junction 列，无法进行 junction-based clonotyping。")
+
+    heavy_df = df[df["chain_type"] == "Heavy"].copy()
+
+    heavy_df["junction_nt"] = heavy_df["junction"].apply(normalize_junction_nt)
+
+    heavy_df = heavy_df[
+        heavy_df["v_gene"].ne("")
+        & heavy_df["j_gene"].ne("")
+        & heavy_df["junction_nt"].notna()
+    ].copy()
+
+    heavy_df["junction_length"] = heavy_df["junction_nt"].str.len()
+
+    if DROP_DUPLICATE_SEQUENCE_ID:
+        before = len(heavy_df)
+        heavy_df = heavy_df.drop_duplicates(subset=["sequence_id"]).copy()
+        after = len(heavy_df)
+        print(f"Dropped duplicated sequence_id: {before - after}")
+
+    heavy_df = heavy_df.reset_index(drop=True)
+
+    print(f"\nRetained productive heavy-chain records for clonotyping: {len(heavy_df)}")
+    return heavy_df
+
+
+# =========================
+# 7. heavy-only clonotyping
+# =========================
+def run_heavy_clonotyping(df, max_distance=0.15):
+    """
+    最一般化逻辑：
+    - 同 V gene
+    - 同 J gene
+    - 同 junction nt length
+    - 组内按 junction nt 的 normalized Hamming distance 聚类
+    """
+    df = df.copy().reset_index(drop=True)
+
+    df["group_key"] = (
+        df["v_gene"] + "|" +
+        df["j_gene"] + "|" +
+        df["junction_length"].astype(str)
+    )
+
+    df["clone_id"] = -1
+    clone_counter = 1
+
+    for _, group in df.groupby("group_key", sort=False):
+        indices = group.index.tolist()
+
+        if len(indices) == 1:
+            df.at[indices[0], "clone_id"] = clone_counter
+            clone_counter += 1
             continue
 
-        # 分配新 Clone ID
-        current_clone_id = clone_id_counter
-        heavy_df.at[current_idx, 'clone_id'] = current_clone_id
-        clone_seq = heavy_df.at[current_idx, 'cdr3']  # 注意：这里用核苷酸 cdr3 聚类更准，如果只有 aa，改用 cdr3_aa
+        uf = UnionFind(indices)
 
-        # 找同组里剩下的
-        remains = []
-        for other_idx in indices:
-            other_seq = heavy_df.at[other_idx, 'cdr3']
-            # 计算距离
-            dist = hamming_dist(clone_seq, other_seq)
-            if dist <= DIST_THRESHOLD:
-                # 归为同一克隆
-                heavy_df.at[other_idx, 'clone_id'] = current_clone_id
-            else:
-                remains.append(other_idx)
+        for i in range(len(indices)):
+            idx_i = indices[i]
+            seq_i = df.at[idx_i, "junction_nt"]
 
-        indices = remains
-        clone_id_counter += 1
+            for j in range(i + 1, len(indices)):
+                idx_j = indices[j]
+                seq_j = df.at[idx_j, "junction_nt"]
 
-print(f"Total Clones Identified: {clone_id_counter - 1}")
+                dist = normalized_hamming_distance(seq_i, seq_j)
+                if dist <= max_distance:
+                    uf.union(idx_i, idx_j)
 
-print("\n--- Generating Clone Plots ---")
+        root_to_clone = {}
+        for idx in indices:
+            root = uf.find(idx)
+            if root not in root_to_clone:
+                root_to_clone[root] = clone_counter
+                clone_counter += 1
+            df.at[idx, "clone_id"] = root_to_clone[root]
 
-# 统计克隆大小
-clone_counts = heavy_df['clone_id'].value_counts().reset_index()
-clone_counts.columns = ['clone_id', 'size']
+    return df
 
-# 饼图 (展示前20大克隆 + Others)
-top_n = 19
-top_clones = clone_counts.head(top_n)
-others_count = clone_counts.iloc[top_n:]['size'].sum() if len(clone_counts) > top_n else 0
 
-labels = [f"Clone {cid}" for cid in top_clones['clone_id']]
-sizes = list(top_clones['size'])
-if others_count > 0:
-    labels.append("Others")
-    sizes.append(others_count)
+# =========================
+# 8. 输出整理
+# =========================
+def make_output_tables(df):
+    clone_counts = (
+        df["clone_id"]
+        .value_counts()
+        .rename_axis("clone_id")
+        .reset_index(name="size")
+    )
 
-# 绘制甜甜圈图 
-plt.figure(figsize=(10, 10))
-plt.pie(
-    sizes,
-    labels=labels,
-    autopct='%1.1f%%',
-    startangle=140,
-    pctdistance=0.82,     # 百分比更靠内，避免重叠
-    textprops={'fontsize': 12}
-)
+    result_df = df.merge(clone_counts, on="clone_id", how="left")
+    result_df = result_df.rename(columns={"size": "clone_size"})
 
-# 画内圈（甜甜圈洞）
-centre_circle = plt.Circle(
-    (0, 0),
-    0.70,                  # 洞大小
-    fc='white',
-    edgecolor='black',
-    linewidth=1.2          # 让洞的边更清晰
-)
-fig = plt.gcf()
-fig.gca().add_artist(centre_circle)
+    summary_df = (
+        result_df
+        .sort_values(["clone_size", "clone_id"], ascending=[False, True])
+        .groupby("clone_id", as_index=False)
+        .first()[[
+            "clone_id",
+            "clone_size",
+            "v_gene",
+            "j_gene",
+            "junction_length",
+            "junction_nt",
+            "sequence_id"
+        ]]
+        .rename(columns={
+            "junction_nt": "representative_junction_nt",
+            "sequence_id": "representative_sequence_id"
+        })
+        .sort_values(["clone_size", "clone_id"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
 
-# 写入中心文字（*仅总细胞数*）
-total_cells = heavy_df.shape[0]
+    return result_df, summary_df, clone_counts
 
-plt.text(
-    0, 0,
-    f"N = {total_cells}",   # 中心显示总细胞数
-    ha='center',
-    va='center',
-    fontsize=18,
-    fontweight='bold'
-)
 
-# 标题 & 保存
-plt.title(f"Clonal Distribution (Top {top_n})", fontsize=18, pad=20)
-plt.tight_layout()
-plt.savefig(f"{OUTPUT_DIR}/Clone_Pie_Chart.png", dpi=300)
-plt.close()
+# =========================
+# 9. 主程序
+# =========================
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# 保存配对结果
-# 把轻链信息合回来
-light_df = df[df['chain_type'] == 'Light'][['cell_id', 'v_call', 'cdr3_aa', 'sequence_id']].rename(columns={
-    'v_call': 'light_v_call', 'cdr3_aa': 'light_cdr3_aa', 'sequence_id': 'light_sequence_id'
-})
+    # 读取 productive 原始数据
+    raw_df = load_raw_data(INPUT_FILE)
+    print(f"Total productive sequences: {len(raw_df)}")
+    print(raw_df["chain_type"].value_counts())
 
-final_df = pd.merge(heavy_df, light_df, on='cell_id', how='left')
-final_df = pd.merge(final_df, clone_counts, on='clone_id', how='left')
+    # 保留原始可视化
+    plot_gene_usage(raw_df, OUTPUT_DIR)
+    plot_shm(raw_df, OUTPUT_DIR)
+    plot_cdr3_length(raw_df, OUTPUT_DIR)
 
-# 输出最终表格
-final_csv = f"{OUTPUT_DIR}/Final_Clonotypes_Analysis.csv"
-final_df.to_csv(final_csv, index=False)
-print(f"✅ Analysis Complete! Results saved to: {final_csv}")
+    # heavy-only clonotyping 输入
+    heavy_df = prepare_heavy_clonotyping_input(raw_df)
+
+    if len(heavy_df) == 0:
+        raise ValueError("过滤后没有可用于 heavy-only clonotyping 的记录。")
+
+    print("\n--- Running Heavy-Only Clonotyping ---")
+    cloned_df = run_heavy_clonotyping(heavy_df, max_distance=MAX_DISTANCE)
+
+    print(f"Total Clones Identified: {cloned_df['clone_id'].nunique()}")
+
+    # 输出表格
+    result_df, summary_df, clone_counts = make_output_tables(cloned_df)
+
+    result_file = os.path.join(OUTPUT_DIR, "Heavy_Clonotypes.tsv")
+    summary_file = os.path.join(OUTPUT_DIR, "Clone_Summary.tsv")
+
+    result_df.to_csv(result_file, sep="\t", index=False)
+    summary_df.to_csv(summary_file, sep="\t", index=False)
+
+    # clone 可视化
+    plot_clone_donut(
+        clone_counts=clone_counts,
+        total_cells=len(cloned_df),
+        output_dir=OUTPUT_DIR,
+        top_n=TOP_N_CLONES_IN_PIE
+    )
+
+    # summary
+    n_seq = len(result_df)
+    n_clone = result_df["clone_id"].nunique()
+    largest_clone = result_df["clone_size"].max()
+
+    print("\n===== Summary =====")
+    print(f"Sequences retained for clonotyping : {n_seq}")
+    print(f"Clones identified                  : {n_clone}")
+    print(f"Largest clone size                 : {largest_clone}")
+    print(f"Result file                        : {result_file}")
+    print(f"Summary file                       : {summary_file}")
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
 ===========================================================================================================================
-Ctrl+O 保存
-Enter  确认
-Ctrl+X 退出
-
+Esc 退出插入模式
+:wq 保存文件并退出
 ===========================================================================================================================执行脚本===============================================================================================================================================================
 python3 01_ab1_to_fasta.py
 bash 02_run_igblast.sh
@@ -389,7 +750,7 @@ python3 03_analyze_clones.py
 
 ==================================================================================================================================================================================================================================================================================================
 #results文件夹下的结果请及时转移，避免新运行产生的结果混淆
-#后续只需把原始测序文件放入raw_data文件夹下，先source ~/.bashrc , conda activate immcantation并且cd ~/bcr/scripts依次执行三个脚本即可
+#后续只需把原始测序文件放入raw_data文件夹下，先source ~/.bashrc , conda activate bcr并且cd ~/bcr/scripts依次执行三个脚本即可
 
 
 
