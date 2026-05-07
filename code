@@ -244,6 +244,8 @@ i 进入插入模式，粘贴下面这个脚本
 ==========================================03_analyze_clones.py==========================================================
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
+
 import os
 import re
 import pandas as pd
@@ -252,7 +254,7 @@ import matplotlib.pyplot as plt
 
 
 # =========================
-# 1. 路径和参数
+# 1. 路径和参数：只改这里
 # =========================
 INPUT_FILE = "../results/02_igblast_results.tsv"
 OUTPUT_DIR = "../results/analysis_output"
@@ -399,10 +401,24 @@ def plot_gene_usage(df, output_dir):
     heavy_v = heavy_df["v_gene"].dropna().value_counts().head(20)
 
     if not heavy_v.empty:
+        heavy_plot = (
+            heavy_v
+            .rename_axis("v_gene")
+            .reset_index(name="count")
+        )
+
         plt.figure(figsize=(12, 8))
-        sns.barplot(x=heavy_v.values, y=heavy_v.index, palette="viridis")
+        sns.barplot(
+            data=heavy_plot,
+            x="count",
+            y="v_gene",
+            hue="v_gene",
+            palette="viridis",
+            legend=False
+        )
         plt.title("Top 20 Heavy Chain V-Gene Usage")
         plt.xlabel("Count")
+        plt.ylabel("V Gene")
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, "Heavy_V_Usage.png"), dpi=300)
         plt.close()
@@ -412,10 +428,24 @@ def plot_gene_usage(df, output_dir):
     light_v = light_df["v_gene"].dropna().value_counts().head(20)
 
     if not light_v.empty:
+        light_plot = (
+            light_v
+            .rename_axis("v_gene")
+            .reset_index(name="count")
+        )
+
         plt.figure(figsize=(12, 8))
-        sns.barplot(x=light_v.values, y=light_v.index, palette="plasma")
+        sns.barplot(
+            data=light_plot,
+            x="count",
+            y="v_gene",
+            hue="v_gene",
+            palette="plasma",
+            legend=False
+        )
         plt.title("Top 20 Light Chain V-Gene Usage")
         plt.xlabel("Count")
+        plt.ylabel("V Gene")
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, "Light_V_Usage.png"), dpi=300)
         plt.close()
@@ -635,22 +665,30 @@ def run_heavy_clonotyping(df, max_distance=0.15):
                 clone_counter += 1
             df.at[idx, "clone_id"] = root_to_clone[root]
 
-    return df
+    return df.copy()
 
 
 # =========================
 # 8. 输出整理
 # =========================
 def make_output_tables(df):
+    # 先 copy 一次，去碎片化
+    df = df.copy()
+
     clone_counts = (
-        df["clone_id"]
-        .value_counts()
-        .rename_axis("clone_id")
-        .reset_index(name="size")
+        df
+        .groupby("clone_id", as_index=False)
+        .size()
+        .rename(columns={"size": "size"})
+        .sort_values(["size", "clone_id"], ascending=[False, True])
+        .reset_index(drop=True)
     )
 
-    result_df = df.merge(clone_counts, on="clone_id", how="left")
-    result_df = result_df.rename(columns={"size": "clone_size"})
+    clone_size_map = clone_counts.set_index("clone_id")["size"]
+
+    result_df = df.assign(
+        clone_size=df["clone_id"].map(clone_size_map)
+    ).copy()
 
     summary_df = (
         result_df
@@ -671,6 +709,7 @@ def make_output_tables(df):
         })
         .sort_values(["clone_size", "clone_id"], ascending=[False, True])
         .reset_index(drop=True)
+        .copy()
     )
 
     return result_df, summary_df, clone_counts
